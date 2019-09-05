@@ -1,7 +1,8 @@
 import itertools
 import json
 import logging
-import string, torch
+import string
+import torch
 import numpy as np
 from collections import defaultdict
 from typing import Dict, List, Union, Tuple, Any
@@ -21,9 +22,7 @@ from allennlp.data.instance import Instance
 from allennlp.data.token_indexers import SingleIdTokenIndexer, TokenIndexer
 from allennlp.data.tokenizers import Token, Tokenizer, WordTokenizer
 
-
 logger = logging.getLogger(__name__)
-
 
 WORD_NUMBER_MAP = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
                    "five": 5, "six": 6, "seven": 7, "eight": 8,
@@ -83,6 +82,7 @@ class DropReader(DatasetReader):
         being a little more generous in what is being marginalized.  Note that this will not
         affect evaluation.
     """
+
     def __init__(self,
                  tokenizer: Tokenizer = None,
                  token_indexers: Dict[str, TokenIndexer] = None,
@@ -91,7 +91,8 @@ class DropReader(DatasetReader):
                  question_length_limit: int = None,
                  skip_when_all_empty: List[str] = None,
                  instance_format: str = "drop",
-                 relaxed_span_match_for_finding_labels: bool = True) -> None:
+                 relaxed_span_match_for_finding_labels: bool = True,
+                 max_num_nums: int = 25) -> None:
         super().__init__(lazy)
         self._tokenizer = tokenizer or WordTokenizer()
         self._token_indexers = token_indexers or {"tokens": SingleIdTokenIndexer()}
@@ -105,8 +106,8 @@ class DropReader(DatasetReader):
         self.relaxed_span_match_for_finding_labels = relaxed_span_match_for_finding_labels
 
         self.all_numbers = np.array([])  # list of all numbers in paragraphs, used for rescaling
-        self.mean = None
-        self.sd = None
+        self.num_numbers = {}
+        self.max_num_nums = max_num_nums
 
     @overrides
     def _read(self, file_path: str):
@@ -132,48 +133,27 @@ class DropReader(DatasetReader):
                     if "validated_answers" in question_answer:
                         answer_annotations += question_answer["validated_answers"]
 
-                    self.process_numbers(question_text,
-                                         passage_text,
-                                         question_id,
-                                         passage_id,
-                                         answer_annotations,
-                                         passage_tokens)
+            # UNCOMMENT TO FIND NUMBER DISTRIBUTION
 
-            self.mean = self.all_numbers.mean()
-            self.sd = self.all_numbers.std()
-            logger.info("Mean of all numbers = %f \n", self.mean)
-            logger.info("Sd of all numbers = %f \n", self.sd)
+                    # self.process_numbers(question_text,
+                    #                      passage_text,
+                    #                      question_id,
+                    #                      passage_id,
+                    #                      answer_annotations,
+                    #                      passage_tokens)
 
-            # # write to jsonnet file
-            # with open("/home/agupta/workspace/allennlp/training_config/naqanet.jsonnet", "r") as jsonFile:
-            #     data = json.load(jsonFile)
-            #     data["model"]["mean"] = self.mean
-            #     data["model"]["sd"] = self.sd
-            #
-            # with open("/home/agupta/workspace/allennlp/training_config/naqanet.jsonnet", "w") as jsonFile:
-            #     json.dump(data, jsonFile)
+            # if self.all_numbers:
+            #     self.mean = self.all_numbers.mean()
+            # else:
+            #     self.mean = 0
+            # if len(self.all_numbers) > 1:
+            #     self.sd = self.all_numbers.std()
+            # else:
+            #     self.sd = 1
 
-            with open("/home/agupta/meansd.txt", "w") as f:
-                f.write(str(self.mean) + " " + str(self.sd))
-                f.close()
-
-        # load mean and sd
-        # with open("/home/agupta/workspace/allennlp/training_config/naqanet.jsonnet", "r") as jsonFile:
-        #     data = json.load(jsonFile)
-        #     self.mean = data["model"]["mean"]
-        #     self.sd = data["model"]["sd"]
-        #     jsonFile.close()
-
-        with open("/home/agupta/meansd.txt", "r") as f:
-            msd = f.read()
-            # print("msd =", msd)
-            mstr, sdstr = msd.split()
-            self.mean = float(mstr)
-            self.sd = float(sdstr)
-            f.close()
-
-        logger.info("Mean read from file = %f \n", self.mean)
-        logger.info("Sd read from file = %f \n", self.sd)
+            # logger.info("Mean of all numbers = %f \n", self.mean)
+            # logger.info("Sd of all numbers = %f \n", self.sd)
+            # logger.info("Number distribution %s", self.num_numbers)
 
         with open(file_path) as dataset_file:
             dataset = json.load(dataset_file)
@@ -196,9 +176,7 @@ class DropReader(DatasetReader):
                                                  question_id,
                                                  passage_id,
                                                  answer_annotations,
-                                                 passage_tokens,
-                                                 self.mean,
-                                                 self.sd)
+                                                 passage_tokens)
                 if instance is not None:
                     kept_count += 1
                     yield instance
@@ -206,14 +184,14 @@ class DropReader(DatasetReader):
                     skip_count += 1
         logger.info(f"Skipped {skip_count} questions, kept {kept_count} questions.")
 
-    #@overrides
+    # @overrides
     def process_numbers(self,  # type: ignore
-                         question_text: str,
-                         passage_text: str,
-                         question_id: str = None,
-                         passage_id: str = None,
-                         answer_annotations: List[Dict] = None,
-                         passage_tokens: List[Token] = None) -> Union[Instance, None]:
+                        question_text: str,
+                        passage_text: str,
+                        question_id: str = None,
+                        passage_id: str = None,
+                        answer_annotations: List[Dict] = None,
+                        passage_tokens: List[Token] = None) -> Union[Instance, None]:
         '''extract all numbers from passage and append to self.all_numbers; note this is done multiple times
         for each paragraph at the moment'''
 
@@ -224,9 +202,11 @@ class DropReader(DatasetReader):
         question_tokens = self._tokenizer.tokenize(question_text)
         question_tokens = split_tokens_by_hyphen(question_tokens)
         if self.passage_length_limit is not None:
+            #logger.info("passage_length = %s", len(passage_tokens))
             passage_tokens = passage_tokens[: self.passage_length_limit]
         if self.question_length_limit is not None:
             question_tokens = question_tokens[: self.question_length_limit]
+            #logger.info("question_length = %s", len(question_tokens))
 
         answer_type: str = None
         answer_texts: List[str] = []
@@ -268,7 +248,8 @@ class DropReader(DatasetReader):
                     target_numbers.append(number)
             valid_signs_for_add_sub_expressions: List[List[int]] = []
             valid_counts: List[int] = []
-            if answer_type in ["number", "date"]:
+            # if answer_type in ["number", "date"]:
+            if answer_type in ["number"]:
                 valid_signs_for_add_sub_expressions = self.find_valid_add_sub_expressions(numbers_in_passage,
                                                                                           target_numbers)
             if answer_type in ["number"]:
@@ -285,8 +266,12 @@ class DropReader(DatasetReader):
                     and not any(type_to_answer_map[skip_type] for skip_type in self.skip_when_all_empty):
                 return None
             else:
-                # logger.info(numbers_in_passage)
                 self.all_numbers = np.concatenate((self.all_numbers, np.array(numbers_in_passage)))
+                l = len(numbers_in_passage)
+                if l in self.num_numbers:
+                    self.num_numbers[l] += 1
+                else:
+                    self.num_numbers[l] = 1
 
     @overrides
     def text_to_instance(self,  # type: ignore
@@ -295,9 +280,7 @@ class DropReader(DatasetReader):
                          question_id: str = None,
                          passage_id: str = None,
                          answer_annotations: List[Dict] = None,
-                         passage_tokens: List[Token] = None,
-                         mean: float = 0.,
-                         sd: float = 1.) -> Union[Instance, None]:
+                         passage_tokens: List[Token] = None) -> Union[Instance, None]:
         # pylint: disable=arguments-differ
         if not passage_tokens:
             passage_tokens = self._tokenizer.tokenize(passage_text)
@@ -339,12 +322,12 @@ class DropReader(DatasetReader):
                                                        # this `answer_texts` will not be used for evaluation
                                                        answer_texts,
                                                        additional_metadata={
-                                                               "original_passage": passage_text,
-                                                               "original_question": question_text,
-                                                               "passage_id": passage_id,
-                                                               "question_id": question_id,
-                                                               "valid_passage_spans": valid_passage_spans,
-                                                               "answer_annotations": answer_annotations})
+                                                           "original_passage": passage_text,
+                                                           "original_question": question_text,
+                                                           "passage_id": passage_id,
+                                                           "question_id": question_id,
+                                                           "valid_passage_spans": valid_passage_spans,
+                                                           "answer_annotations": answer_annotations})
         elif self.instance_format == "bert":
             question_concat_passage_tokens = question_tokens + [Token("[SEP]")] + passage_tokens
             valid_passage_spans = []
@@ -367,11 +350,11 @@ class DropReader(DatasetReader):
                                                 passage_text,
                                                 answer_info,
                                                 additional_metadata={
-                                                        "original_passage": passage_text,
-                                                        "original_question": question_text,
-                                                        "passage_id": passage_id,
-                                                        "question_id": question_id,
-                                                        "answer_annotations": answer_annotations})
+                                                    "original_passage": passage_text,
+                                                    "original_question": question_text,
+                                                    "passage_id": passage_id,
+                                                    "question_id": question_id,
+                                                    "answer_annotations": answer_annotations})
         elif self.instance_format == "drop":
             numbers_in_passage = []
             number_indices = []
@@ -380,25 +363,27 @@ class DropReader(DatasetReader):
                 if number is not None:
                     numbers_in_passage.append(number)
                     number_indices.append(token_index)
+            numbers_in_passage = np.array(numbers_in_passage)
             # hack to guarantee minimal length of padded number
             number_indices.append(-1)
-            #scaled_numbers_in_passage = [(number - mean) / sd for number in numbers_in_passage]
-            # numbers_as_tokens = [Token(str(number)) for number in scaled_numbers_in_passage]
-            logged_numbers_in_passage = [np.log(1 + number) for number in numbers_in_passage]
-            numbers_as_tokens = [Token(str(number)) for number in logged_numbers_in_passage]
 
-            logged_numbers_in_passage = [np.log(1 + number) for number in numbers_in_passage]
-
-            # l = len(scaled_numbers_in_passage)
-            # if l < 10:  # max is 10
-            #     scaled_numbers_in_passage_padded = scaled_numbers_in_passage + [0] * (10 - l)
-            # else:
-            #     scaled_numbers_in_passage_padded = scaled_numbers_in_passage[:10]
-            l = len(logged_numbers_in_passage)
-            if l < 10:  # max is 10
-                logged_numbers_in_passage_padded = logged_numbers_in_passage + [0] * (10 - l)
+            l = len(numbers_in_passage)
+            if l > 0:
+                passage_mean = np.mean(numbers_in_passage)
             else:
-                logged_numbers_in_passage_padded = logged_numbers_in_passage[:10]
+                passage_mean = 0
+            if l > 1:
+                passage_sd = np.std(numbers_in_passage)
+            else:
+                passage_sd = 1
+            scaled_numbers_in_passage = (numbers_in_passage - passage_mean) / passage_sd
+            numbers_as_tokens = [Token(str(number)) for number in scaled_numbers_in_passage]
+
+            if l < self.max_num_nums:  # using maximum number of numbers in passage considered
+                scaled_numbers_in_passage_padded = np.concatenate((scaled_numbers_in_passage, \
+                                                        np.zeros(self.max_num_nums - l)))
+            else:
+                scaled_numbers_in_passage_padded = scaled_numbers_in_passage[:self.max_num_nums]
 
             valid_passage_spans = \
                 self.find_valid_spans(passage_tokens, tokenized_answer_texts) if tokenized_answer_texts else []
@@ -413,7 +398,8 @@ class DropReader(DatasetReader):
                     target_numbers.append(number)
             valid_signs_for_add_sub_expressions: List[List[int]] = []
             valid_counts: List[int] = []
-            if answer_type in ["number", "date"]:
+            # if answer_type in ["number", "date"]:
+            if answer_type in ["number"]:
                 valid_signs_for_add_sub_expressions = self.find_valid_add_sub_expressions(numbers_in_passage,
                                                                                           target_numbers)
             if answer_type in ["number"]:
@@ -444,15 +430,16 @@ class DropReader(DatasetReader):
                                                     passage_text,
                                                     answer_info,
                                                     additional_metadata={
-                                                            "original_passage": passage_text,
-                                                            "original_question": question_text,
-                                                            "original_numbers": numbers_in_passage,
-                                                            #"scaled_numbers_padded": scaled_numbers_in_passage_padded,
-                                                            "logged_numbers_padded": logged_numbers_in_passage_padded,
-                                                            "passage_id": passage_id,
-                                                            "question_id": question_id,
-                                                            "answer_info": answer_info,
-                                                            "answer_annotations": answer_annotations})
+                                                        "original_passage": passage_text,
+                                                        "original_question": question_text,
+                                                        "original_numbers": numbers_in_passage,
+                                                        "scaled_numbers_padded": scaled_numbers_in_passage_padded,
+                                                        "passage_mean": passage_mean,
+                                                        "passage_sd": passage_sd,
+                                                        "passage_id": passage_id,
+                                                        "question_id": question_id,
+                                                        "answer_info": answer_info,
+                                                        "answer_annotations": answer_annotations})
         else:
             raise ValueError(f"Expect the instance format to be \"drop\", \"squad\" or \"bert\", "
                              f"but got {self.instance_format}")
