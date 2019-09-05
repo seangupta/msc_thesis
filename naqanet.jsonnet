@@ -14,7 +14,8 @@
         "passage_length_limit": 400,
         "question_length_limit": 50,
         "skip_when_all_empty": ["addition_subtraction"],
-        "instance_format": "drop"
+        "instance_format": "drop",
+        "max_num_nums": 25
     },
     "validation_dataset_reader": {
         "type": "drop",
@@ -31,7 +32,8 @@
         "passage_length_limit": 1000,
         "question_length_limit": 100,
         "skip_when_all_empty": ["addition_subtraction"],
-        "instance_format": "drop"
+        "instance_format": "drop",
+        "max_num_nums": 25
     },
     "vocabulary": {
         "min_count": {
@@ -42,8 +44,8 @@
         },
         "only_include_pretrained_words": true
     },
-    "train_data_path": "/home/agupta/workspace/drop_dataset/drop_dataset_train_short.json",
-    #"validation_data_path": "/home/agupta/workspace/drop_dataset/drop_dataset_train_short.json",
+    "train_data_path": "/home/agupta/workspace/drop_dataset/drop_dataset_train.json",
+    "validation_data_path": "/home/agupta/workspace/drop_dataset/drop_dataset_dev.json",
     "model": {
         "type": "naqanet",
         "text_field_embedder": {
@@ -118,7 +120,12 @@
         "answering_abilities": [
             "addition_subtraction"
         ],
-        "sigma": 1
+        "sigma": 1,
+        "g": 1,
+        "tau_decay_rate": 1,
+        "max_num_nums": 25,
+        "loss": "square",
+        "use_encoded_nums": false
     },
     "iterator": {
         "type": "bucket",
@@ -136,9 +143,9 @@
         "max_instances_in_memory": 600
     },
     "trainer": {
-        "num_epochs": 10000,
+        "num_epochs": 200,
         "grad_norm": 5,
-        "patience": 10000,
+        "patience": 50,
         "validation_metric": "+f1",
         "cuda_device": 0,
         "optimizer": {
