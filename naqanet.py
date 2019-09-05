@@ -1,7 +1,6 @@
 from typing import Any, Dict, List, Optional
 import logging
-
-import torch, math
+import torch
 
 from allennlp.data import Vocabulary
 from allennlp.models.model import Model
@@ -14,7 +13,6 @@ from allennlp.modules.matrix_attention.matrix_attention import MatrixAttention
 from allennlp.nn import util, InitializerApplicator, RegularizerApplicator
 from allennlp.nn.util import masked_softmax
 from allennlp.training.metrics.drop_em_and_f1 import DropEmAndF1
-
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +29,7 @@ class NumericallyAugmentedQaNet(Model):
     has separate modeling logic to predict that answer type.  We then marginalize over all possible
     ways of getting to the right answer through each of these answer types.
     """
+
     def __init__(self, vocab: Vocabulary,
                  text_field_embedder: TextFieldEmbedder,
                  num_highway_layers: int,
@@ -41,7 +40,12 @@ class NumericallyAugmentedQaNet(Model):
                  initializer: InitializerApplicator = InitializerApplicator(),
                  regularizer: Optional[RegularizerApplicator] = None,
                  answering_abilities: List[str] = None,
-                 sigma: float = 1.) -> None:
+                 sigma: float = 1.,
+                 g: float = 1,
+                 tau_decay_rate: float = 1,
+                 max_num_nums: int = 25,
+                 loss: str = "square",
+                 use_encoded_nums: float = False) -> None:
         logger.info("instantiating model")
         super().__init__(vocab, regularizer)
 
@@ -74,20 +78,14 @@ class NumericallyAugmentedQaNet(Model):
         self._question_weights_predictor = torch.nn.Linear(encoding_out_dim, 1)
 
         self.sigma = sigma  # variance for NAC, need to tune
-        # self.mean = mean  # from jsonnet file
-        # logger.info("mean read in model from jsonnet file = %f", self.mean)
-        # self.sd = sd  # from jsonnet file
-        # logger.info("sd read in model from jsonnet file = %f", self.sd)
 
-        with open("/home/agupta/meansd.txt", "r") as f:
-            msd = f.read()
-            # print("msd =", msd)
-            mstr, sdstr = msd.split()
-            self.mean = float(mstr)
-            self.sd = float(sdstr)
-            f.close()
-        #logger.info("mean read in model from txtfile = %f", self.mean)
-        #logger.info("sd read in model from txtfile = %f", self.sd)
+        self.g = g  # regularisation parameter
+        self.tau = 1  # temperature parameter
+        self.tau_min = 10 ** (-5) # minimum possible temperature
+        self.tau_decay_rate = tau_decay_rate
+        self.max_num_nums = max_num_nums # maximum number of numbers in paragraph considered
+        self.loss = loss # square or absolute loss
+        self.use_encoded_nums = use_encoded_nums # use model with or without encoded numbers
 
         if len(self.answering_abilities) > 1:
             self._answer_ability_predictor = FeedForward(modeling_out_dim + encoding_out_dim,
@@ -127,19 +125,30 @@ class NumericallyAugmentedQaNet(Model):
         if "addition_subtraction" in self.answering_abilities:
             self._addition_subtraction_index = self.answering_abilities.index("addition_subtraction")
 
-            self.What_predictor = FeedForward(modeling_out_dim + encoding_out_dim,
-            #self.What_predictor = FeedForward(modeling_out_dim * 2,
-                                              activations=[Activation.by_name('relu')(),
-                                                           Activation.by_name('linear')()],
-                                              hidden_dims=[modeling_out_dim, 10],
-                                              num_layers=2)  # max numbers of numbers in passage is 10
+            if not use_encoded_nums:
+                self.What_predictor = FeedForward(modeling_out_dim + encoding_out_dim,
+                                                  activations=[Activation.by_name('relu')(),
+                                                               Activation.by_name('linear')()],
+                                                  hidden_dims=[modeling_out_dim, max_num_nums],
+                                                  num_layers=2)  # using max numbers of numbers in passage
 
-            self.Mhat_predictor = FeedForward(modeling_out_dim + encoding_out_dim,
-            #self.Mhat_predictor = FeedForward(modeling_out_dim * 2,
-                                              activations=[Activation.by_name('relu')(),
-                                                           Activation.by_name('linear')()],
-                                              hidden_dims=[modeling_out_dim, 10],
-                                              num_layers=2)
+                self.Mhat_predictor = FeedForward(modeling_out_dim + encoding_out_dim,
+                                                  activations=[Activation.by_name('relu')(),
+                                                               Activation.by_name('linear')()],
+                                                  hidden_dims=[modeling_out_dim, max_num_nums],
+                                                  num_layers=2)
+            else:
+                self.What_predictor = FeedForward(modeling_out_dim * 5,
+                                                   activations=[Activation.by_name('relu')(),
+                                                                Activation.by_name('linear')()],
+                                                   hidden_dims=[modeling_out_dim, 1],
+                                                   num_layers=2)
+
+                self.Mhat_predictor = FeedForward(modeling_out_dim * 5,
+                                                   activations=[Activation.by_name('relu')(),
+                                                                Activation.by_name('linear')()],
+                                                   hidden_dims=[modeling_out_dim, 1],
+                                                   num_layers=2)
 
         if "counting" in self.answering_abilities:
             self._counting_index = self.answering_abilities.index("counting")
@@ -201,10 +210,10 @@ class NumericallyAugmentedQaNet(Model):
 
         # Shape: (batch_size, passage_length, encoding_dim * 4)
         merged_passage_attention_vectors = self._dropout(
-                torch.cat([encoded_passage, passage_question_vectors,
-                           encoded_passage * passage_question_vectors,
-                           encoded_passage * passage_passage_vectors],
-                          dim=-1))
+            torch.cat([encoded_passage, passage_question_vectors,
+                       encoded_passage * passage_question_vectors,
+                       encoded_passage * passage_passage_vectors],
+                      dim=-1))
 
         # The recurrent modeling layers. Since these layers share the same parameters,
         # we don't construct them conditioned on answering abilities.
@@ -214,6 +223,8 @@ class NumericallyAugmentedQaNet(Model):
             modeled_passage_list.append(modeled_passage)
         # Pop the first one, which is input
         modeled_passage_list.pop(0)
+
+        # logger.info("P_bar.shape = %s", modeled_passage_list[0].shape)
 
         # The first modeling layer is used to calculate the vector representation of passage
         passage_weights = self._passage_weights_predictor(modeled_passage_list[0]).squeeze(-1)
@@ -225,6 +236,8 @@ class NumericallyAugmentedQaNet(Model):
         question_weights = masked_softmax(question_weights, question_mask)
         question_vector = util.weighted_sum(encoded_question, question_weights)
 
+        self.tau = max(self.tau_min, self.tau * self.tau_decay_rate) # decay temperature
+
         if len(self.answering_abilities) > 1:
             # Shape: (batch_size, number_of_abilities)
             answer_ability_logits = \
@@ -234,7 +247,7 @@ class NumericallyAugmentedQaNet(Model):
 
         if "counting" in self.answering_abilities:
             # Shape: (batch_size, 10)
-            #count_number_logits = self._count_number_predictor(passage_vector)
+            # count_number_logits = self._count_number_predictor(passage_vector)
             count_number_logits = self._count_number_predictor(torch.cat([passage_vector, question_vector], -1))
             count_number_log_probs = torch.nn.functional.log_softmax(count_number_logits, -1)
             # Info about the best count number prediction
@@ -304,88 +317,57 @@ class NumericallyAugmentedQaNet(Model):
                 best_question_span_log_prob += answer_ability_log_probs[:, self._question_span_extraction_index]
 
         if "addition_subtraction" in self.answering_abilities:
-            # # Shape: (batch_size, # of numbers in the passage)
-            # number_indices = number_indices.squeeze(-1)
-            # number_mask = (number_indices != -1).long()
-            # clamped_number_indices = util.replace_masked_values(number_indices, number_mask, 0)
-            # encoded_passage_for_numbers = torch.cat([modeled_passage_list[0], modeled_passage_list[3]], dim=-1)
-            # # Shape: (batch_size, # of numbers in the passage, encoding_dim)
-            # encoded_numbers = torch.gather(
-            #         encoded_passage_for_numbers,
-            #         1,
-            #         clamped_number_indices.unsqueeze(-1).expand(-1, -1, encoded_passage_for_numbers.size(-1)))
-            # # Shape: (batch_size, # of numbers in the passage)
-            # encoded_numbers = torch.cat(
-            #         [encoded_numbers, passage_vector.unsqueeze(1).repeat(1, encoded_numbers.size(1), 1)], -1)
-            #
-            # # Shape: (batch_size, # of numbers in the passage, 3)
-            # number_sign_logits = self._number_sign_predictor(encoded_numbers)
-            # number_sign_log_probs = torch.nn.functional.log_softmax(number_sign_logits, -1)
-            #
-            # # Shape: (batch_size, # of numbers in passage).
-            # best_signs_for_numbers = torch.argmax(number_sign_log_probs, -1)
-            # # For padding numbers, the best sign masked as 0 (not included).
-            # best_signs_for_numbers = util.replace_masked_values(best_signs_for_numbers, number_mask, 0)
-            # # Shape: (batch_size, # of numbers in passage)
-            # best_signs_log_probs = torch.gather(
-            #         number_sign_log_probs, 2, best_signs_for_numbers.unsqueeze(-1)).squeeze(-1)
-            # # the probs of the masked positions should be 1 so that it will not affect the joint probability
-            # # TODO: this is not quite right, since if there are many numbers in the passage,
-            # # TODO: the joint probability would be very small.
-            # best_signs_log_probs = util.replace_masked_values(best_signs_log_probs, number_mask, 0)
-            # # Shape: (batch_size,)
-            # best_combination_log_prob = best_signs_log_probs.sum(-1)
-
-
-            # # Shape: (batch_size, passage_length, modeling_dim * 2))
-            # passage1 = torch.cat([modeled_passage_list[0], modeled_passage_list[1]], dim=-1)
-            # # Shape: (batch_size, passage_length)
-            # self.What = self.What_predictor(passage1)
-            # # Shape: (batch_size, passage_length, modeling_dim * 2)
-            # passage2 = torch.cat([modeled_passage_list[0], modeled_passage_list[2]], dim=-1)
-            # # Shape: (batch_size, passage_length)
-            # self.Mhat = self.Mhat_predictor(passage2)
-
-            # # Shape: (batch_size, 10)
-            self.What = self.What_predictor(torch.cat([passage_vector, question_vector], -1))
-            #print("self.What\n", self.What)
-            self.Mhat = self.Mhat_predictor(torch.cat([passage_vector, question_vector], -1))
-            #print("self.Mhat\n", self.Mhat)
-
-            self.W = torch.tanh(self.What) * torch.sigmoid(self.Mhat)
-            #logger.info("self.W = %s", torch.round(self.W * 1000) / 1000)
 
             use_cuda = torch.cuda.is_available()
             device = torch.device('cuda:0' if use_cuda else 'cpu')
-            #device = 'cpu'
 
-            # # logger.info("device = %s", device)
-            # scaled_numbers_in_passage = torch.zeros(batch_size, 10)#.to(device)
-            # for i in range(batch_size):
-            #     scaled_numbers_in_passage[i] = torch.FloatTensor(metadata[i]['scaled_numbers_padded'])
-            # print("scaled_numbers_in_passage\n", scaled_numbers_in_passage)
+            if self.use_encoded_nums:
 
-            logged_numbers_in_passage = torch.zeros(batch_size, 10).to(device)
+                # Shape: (batch_size, # of numbers in the passage)
+                number_indices = number_indices.squeeze(-1)
+                number_mask = (number_indices != -1).long()
+                clamped_number_indices = util.replace_masked_values(number_indices, number_mask, 0)
+                encoded_passage_for_numbers = torch.cat([modeled_passage_list[0], modeled_passage_list[3]], dim=-1)
+                # Shape: (batch_size, # of numbers in the passage, encoding_dim)
+                encoded_numbers = torch.gather(
+                    encoded_passage_for_numbers,
+                    1,
+                    clamped_number_indices.unsqueeze(-1).expand(-1, -1, encoded_passage_for_numbers.size(-1)))
+                # Shape: (batch_size, # of numbers in the passage)
+                encoded_numbers = torch.cat(
+                    [encoded_numbers, passage_vector.unsqueeze(1).repeat(1, encoded_numbers.size(1), 1)], -1)
+
+                num_nums = encoded_numbers.shape[1]
+                if num_nums < self.max_num_nums:
+                    target = torch.zeros(batch_size, self.max_num_nums, 384).to(device)
+                    target[:, :num_nums, :] = encoded_numbers
+                else:
+                    target = encoded_numbers[:, :self.max_num_nums, :].to(device)
+
+                K = torch.cat([passage_vector, question_vector], -1).unsqueeze(1).repeat(1, self.max_num_nums, 1).to(device)
+                intermediate = torch.cat((target, K), 2)
+                target = torch.reshape(intermediate, (batch_size * self.max_num_nums, 640))
+                self.What = torch.reshape(self.What_predictor(target), (batch_size, self.max_num_nums))
+                self.Mhat = torch.reshape(self.Mhat_predictor(target), (batch_size, self.max_num_nums))
+
+            else:
+                self.What = self.What_predictor(torch.cat([passage_vector, question_vector], -1))
+                self.Mhat = self.Mhat_predictor(torch.cat([passage_vector, question_vector], -1))
+
+            self.W = torch.tanh(self.What / self.tau) * torch.sigmoid(self.Mhat / self.tau)
+
+            scaled_numbers_in_passage = torch.zeros(batch_size, self.max_num_nums).to(device)
+            means = torch.zeros(batch_size).to(device)
+            sds = torch.zeros(batch_size).to(device)
             for i in range(batch_size):
-                logged_numbers_in_passage[i] = torch.FloatTensor(metadata[i]['logged_numbers_padded'])
-            #logger.info("logged_numbers_in_passage %s", logged_numbers_in_passage)
+                scaled_numbers_in_passage[i] = torch.FloatTensor(metadata[i]['scaled_numbers_padded'])
+                means[i] = float(metadata[i]['passage_mean'])
+                sds[i] = float(metadata[i]['passage_sd'])
 
-            # Shape: (batch_size, )
-            #a = torch.einsum('ij, ij -> i', [self.W, scaled_numbers_in_passage])
-            #logger.info("self.W.shape = %s", self.W.shape)
-            #logger.info("logged_numbers_in_passage.shape = %s", logged_numbers_in_passage.shape)
-            a = torch.einsum('ij, ij -> i', [self.W, logged_numbers_in_passage])
-            #print("a.shape", a.shape)
-            #assert a.shape == (batch_size, )
-
-            #prediction = torch.round(a * self.sd + self.mean)
-            prediction = torch.round(torch.exp(a) - 1)
-            #print("prediction.shape =", prediction.shape)
-            #assert prediction.shape == (batch_size, )
-            #print("prediction\n", prediction)
-
-            # if len(self.answering_abilities) > 1:
-            #     best_combination_log_prob += answer_ability_log_probs[:, self._addition_subtraction_index]
+            # Shape: (batch_size,)
+            scaled_pred = torch.einsum('ij, ij -> i', [self.W, scaled_numbers_in_passage])
+            prediction = scaled_pred * sds + means  # used for loss
+            rdd_prediction = prediction.round()  # used for prediction accuracy
 
         output_dict = {}
 
@@ -453,48 +435,24 @@ class NumericallyAugmentedQaNet(Model):
                     log_marginal_likelihood_list.append(log_marginal_likelihood_for_question_span)
 
                 elif answering_ability == "addition_subtraction":
-                    # # The padded add-sub combinations use 0 as the signs for all numbers, and we mask them here.
-                    # # Shape: (batch_size, # of combinations)
-                    # gold_add_sub_mask = (answer_as_add_sub_expressions.sum(-1) > 0).float()
-                    # # Shape: (batch_size, # of numbers in the passage, # of combinations)
-                    # gold_add_sub_signs = answer_as_add_sub_expressions.transpose(1, 2)
-                    # # Shape: (batch_size, # of numbers in the passage, # of combinations)
-                    # log_likelihood_for_number_signs = torch.gather(number_sign_log_probs, 2, gold_add_sub_signs)
-                    # # the log likelihood of the masked positions should be 0
-                    # # so that it will not affect the joint probability
-                    # log_likelihood_for_number_signs = \
-                    #     util.replace_masked_values(log_likelihood_for_number_signs, number_mask.unsqueeze(-1), 0)
-                    # # Shape: (batch_size, # of combinations)
-                    # log_likelihood_for_add_subs = log_likelihood_for_number_signs.sum(1)
-                    # # For those padded combinations, we set their log probabilities to be very small negative value
-                    # log_likelihood_for_add_subs = \
-                    #     util.replace_masked_values(log_likelihood_for_add_subs, gold_add_sub_mask, -1e7)
-                    # # Shape: (batch_size, )
-                    # log_marginal_likelihood_for_add_sub = util.logsumexp(log_likelihood_for_add_subs)
-
-                    # print(answer_as_add_sub_expressions.shape)
-                    # answer = answer_as_add_sub_expressions.sum(-1)
-                    answer = torch.zeros(batch_size)#.to(device)
+                    answer = torch.zeros(batch_size).to(device)
                     for i in range(batch_size):
-                        ans = metadata[i]['answer_annotations'][0]['number']
-                        # logger.info("true answer = %s", ans)
-                        # logger.info("prediction = %f", prediction[i])
-                        # if len(ans) > 0:
-                        #     scaled_answer[i] = (torch.FloatTensor([float(ans)]) - self.mean) / self.sd
-                        answer[i] = float(ans)
-                    logged_answer = torch.log(1 + torch.FloatTensor(answer)).to(device)
-                    #print("scaled_answer.shape =", scaled_answer.shape)
-                    #logger.info("true answers %s\n", answer.round())
-                    #logger.info("predictions %s\n", prediction.round())
+                        answer[i] = float(metadata[i]['answer_annotations'][0]['number'])
+                    scaled_answer = (answer - means) / sds
+                    scaled_answer.to(device)
 
-                    log_marginal_likelihood_for_add_sub = -math.log(2 * math.pi * self.sigma ** 2) / 2 - (a - logged_answer) ** 2 / (
+                    if self.loss == "square" or None:
+                        log_marginal_likelihood_for_add_sub = - (scaled_pred - scaled_answer) ** 2 / (
                                 2 * self.sigma ** 2)
 
-                    #logger.info("log_marginal_likelihood_for_add_sub = %s \n", log_marginal_likelihood_for_add_sub)
-                    #print("log_marginal_likelihood_for_add_sub.shape", log_marginal_likelihood_for_add_sub.shape)
+                    elif self.loss == "absolute":
+                        log_marginal_likelihood_for_add_sub = - abs(scaled_pred - scaled_answer) / (
+                                2 * self.sigma ** 2)
 
                     if len(self.answering_abilities) > 1:
-                        log_marginal_likelihood_list.append(log_marginal_likelihood_for_add_sub + answer_ability_log_probs[:, self._addition_subtraction_index])
+                        log_marginal_likelihood_list.append(
+                            log_marginal_likelihood_for_add_sub + answer_ability_log_probs[:,
+                                                                  self._addition_subtraction_index])
                     else:
                         log_marginal_likelihood_list.append(log_marginal_likelihood_for_add_sub)
 
@@ -524,7 +482,8 @@ class NumericallyAugmentedQaNet(Model):
             else:
                 marginal_log_likelihood = log_marginal_likelihood_list[0]
 
-            output_dict["loss"] = - marginal_log_likelihood.mean()
+            output_dict["loss"] = - marginal_log_likelihood.mean() + self.g * self.W_regulariser(self.W)
+            logger.info("loss = %s", output_dict['loss'])
 
         # Compute the metrics and add the tokenized input to the output.
         if metadata is not None:
@@ -567,25 +526,9 @@ class NumericallyAugmentedQaNet(Model):
                     answer_json["spans"] = [(start_offset, end_offset)]
                 elif predicted_ability_str == "addition_subtraction":  # plus_minus combination answer
                     answer_json["answer_type"] = "arithmetic"
-                    predicted_res = prediction[i].detach().cpu().numpy()
+                    predicted_res = rdd_prediction[i].detach().cpu().numpy()
                     predicted_answer = str(predicted_res)
                     answer_json["value"] = predicted_res
-
-                    #original_numbers = metadata[i]['original_numbers']
-                    # sign_remap = {0: 0, 1: 1, 2: -1}
-                    # predicted_signs = [sign_remap[it] for it in best_signs_for_numbers[i].detach().cpu().numpy()]
-                    # result = sum([sign * number for sign, number in zip(predicted_signs, original_numbers)])
-                    #offsets = metadata[i]['passage_token_offsets']
-                    #number_indices = metadata[i]['number_indices']
-                    #number_positions = [offsets[index] for index in number_indices]
-                    # answer_json['numbers'] = []
-                    # for offset, value, sign in zip(number_positions, original_numbers, predicted_signs):
-                    #     answer_json['numbers'].append({'span': offset, 'value': value, 'sign': sign})
-                    # if number_indices[-1] == -1:
-                    #     # There is a dummy 0 number at position -1 added in some cases; we are
-                    #     # removing that here.
-                    #     answer_json["numbers"].pop()
-
                 elif predicted_ability_str == "counting":
                     answer_json["answer_type"] = "count"
                     predicted_count = best_count_number[i].detach().cpu().numpy()
@@ -609,3 +552,6 @@ class NumericallyAugmentedQaNet(Model):
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
         exact_match, f1_score = self._drop_metrics.get_metric(reset)
         return {'em': exact_match, 'f1': f1_score}
+
+    def W_regulariser(self, W):
+        return (1 - 2 * abs(abs(W) - 0.5)).mean()
